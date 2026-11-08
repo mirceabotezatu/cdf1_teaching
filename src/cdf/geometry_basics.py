@@ -763,15 +763,18 @@ def create_connected_3d_boxes(
     show_hatch=True,
     hatch_spacing=1.0,
     hatch_color=None,
+    highlight_unstable=True,
+    stability_tolerance=0.0,
 ):
     """
     Grow a connected 3D composition from the center of a bounding cube.
 
-    The first box is centered at base_point and uses the maximum requested
-    dimensions. Each subsequent box is attached to one face of an existing
-    box, sharing a positive-area face overlap. Boxes become smaller as their
-    growth moves away from base_point. Every box remains inside the bounding
-    cube and boxes do not overlap.
+    The first box is centered on base_point in XY, starts on its XY plane,
+    and uses the maximum requested dimensions. Each subsequent box is attached
+    to one face of an existing box, sharing a positive-area face overlap.
+    Boxes become smaller as their growth moves away from base_point. Every box
+    remains inside the bounding volume, which extends upward from the XY plane,
+    and boxes do not overlap.
 
     base_point : Point3d or Rhino object reference -- center of the cube
     cube_size : float -- side length of the bounding cube
@@ -783,6 +786,8 @@ def create_connected_3d_boxes(
     show_hatch : bool -- add square hatch curves to the box faces
     hatch_spacing : float -- spacing between hatch lines
     hatch_color : System.Drawing.Color or None -- hatch curve color
+    highlight_unstable : bool -- color the composition red when unstable
+    stability_tolerance : float -- allowed XY distance outside the support hull
 
     Returns a tuple: (list of geometry objects, list of System.Drawing.Color).
     """
@@ -815,6 +820,8 @@ def create_connected_3d_boxes(
         hatch_spacing = 1.0
     if hatch_color is None:
         hatch_color = Color.Black
+    if stability_tolerance is None:
+        stability_tolerance = 0.0
 
     box_count = int(box_count)
     cube_size = float(cube_size)
@@ -833,6 +840,8 @@ def create_connected_3d_boxes(
         raise ValueError("Every maximum box dimension must fit inside cube_size.")
     if hatch_spacing <= 0:
         raise ValueError("hatch_spacing must be positive.")
+    if stability_tolerance < 0:
+        raise ValueError("stability_tolerance must not be negative.")
 
     generator = random.Random(int(seed))
     half_cube = cube_size / 2.0
@@ -889,9 +898,25 @@ def create_connected_3d_boxes(
             and bounds[1] <= half_cube + epsilon
             and bounds[2] >= -half_cube - epsilon
             and bounds[3] <= half_cube + epsilon
-            and bounds[4] >= -half_cube - epsilon
-            and bounds[5] <= half_cube + epsilon
+            and bounds[4] >= -epsilon
+            and bounds[5] <= cube_size + epsilon
         )
+
+    def aligned_positions(axis_index, size):
+        lower_bound = 0.0 if axis_index == 4 else -half_cube
+        upper_bound = cube_size if axis_index == 4 else half_cube
+        positions = {lower_bound, upper_bound - size}
+        for existing in bounds_list:
+            minimum = existing[axis_index]
+            maximum = existing[axis_index + 1]
+            positions.add(minimum)
+            positions.add(maximum - size)
+        return [
+            position
+            for position in positions
+            if position >= lower_bound - epsilon
+            and position + size <= upper_bound + epsilon
+        ]
 
     def create_box_hatch(bounds):
         x_min, x_max, y_min, y_max, z_min, z_max = bounds
@@ -998,8 +1023,8 @@ def create_connected_3d_boxes(
             root_width / 2.0,
             -root_depth / 2.0,
             root_depth / 2.0,
-            -root_height / 2.0,
-            root_height / 2.0,
+            0.0,
+            root_height,
         )
     ]
     geometry = []
@@ -1017,69 +1042,75 @@ def create_connected_3d_boxes(
 
     while len(bounds_list) < box_count:
         candidates = []
-        for _ in range(1000):
-            parent = generator.choice(bounds_list)
-            direction, sign = generator.choice(directions)
-            parent_center_distance = math.sqrt(
-                (
-                    (parent[0] + parent[1]) / 2.0
-                ) ** 2
-                + (
-                    (parent[2] + parent[3]) / 2.0
-                ) ** 2
-                + (
-                    (parent[4] + parent[5]) / 2.0
-                ) ** 2
-            )
-            estimated_child_distance = parent_center_distance + max(
-                max_width,
-                max_depth,
-                max_height,
-            ) / 2.0
-            width, depth, height = dimensions_for_distance(estimated_child_distance)
-            candidate = None
+        for parent in bounds_list:
+            for direction, sign in directions:
+                parent_center_distance = math.sqrt(
+                    (
+                        (parent[0] + parent[1]) / 2.0
+                    ) ** 2
+                    + (
+                        (parent[2] + parent[3]) / 2.0
+                    ) ** 2
+                    + (
+                        (parent[4] + parent[5]) / 2.0
+                    ) ** 2
+                )
+                estimated_child_distance = parent_center_distance + max(
+                    max_width,
+                    max_depth,
+                    max_height,
+                ) / 2.0
+                width, depth, height = dimensions_for_distance(estimated_child_distance)
+                if direction.startswith("x"):
+                    depth = parent[3] - parent[2]
+                    height = parent[5] - parent[4]
+                    x = parent[0] - width if sign < 0 else parent[1]
+                    y_positions = aligned_positions(2, depth)
+                    z_positions = [
+                        position
+                        for position in aligned_positions(4, height)
+                        if position >= -epsilon
+                    ]
+                    candidate_positions = (
+                        (x, x + width, y, y + depth, z, z + height)
+                        for y in y_positions
+                        for z in z_positions
+                    )
+                elif direction.startswith("y"):
+                    width = parent[1] - parent[0]
+                    height = parent[5] - parent[4]
+                    y = parent[2] - depth if sign < 0 else parent[3]
+                    x_positions = aligned_positions(0, width)
+                    z_positions = [
+                        position
+                        for position in aligned_positions(4, height)
+                        if position >= -epsilon
+                    ]
+                    candidate_positions = (
+                        (x, x + width, y, y + depth, z, z + height)
+                        for x in x_positions
+                        for z in z_positions
+                    )
+                else:
+                    width = parent[1] - parent[0]
+                    depth = parent[3] - parent[2]
+                    z = parent[4] - height if sign < 0 else parent[5]
+                    x_positions = aligned_positions(0, width)
+                    y_positions = aligned_positions(2, depth)
+                    candidate_positions = (
+                        (x, x + width, y, y + depth, z, z + height)
+                        for x in x_positions
+                        for y in y_positions
+                    )
 
-            if direction.startswith("x"):
-                x = parent[0] - width if sign < 0 else parent[1]
-                y_min = generator.uniform(
-                    max(-half_cube, parent[2] - depth + epsilon),
-                    min(parent[3] - epsilon, half_cube - depth),
-                )
-                z_min = generator.uniform(
-                    max(-half_cube, parent[4] - height + epsilon),
-                    min(parent[5] - epsilon, half_cube - height),
-                )
-                candidate = (x, x + width, y_min, y_min + depth, z_min, z_min + height)
-            elif direction.startswith("y"):
-                y = parent[2] - depth if sign < 0 else parent[3]
-                x_min = generator.uniform(
-                    max(-half_cube, parent[0] - width + epsilon),
-                    min(parent[1] - epsilon, half_cube - width),
-                )
-                z_min = generator.uniform(
-                    max(-half_cube, parent[4] - height + epsilon),
-                    min(parent[5] - epsilon, half_cube - height),
-                )
-                candidate = (x_min, x_min + width, y, y + depth, z_min, z_min + height)
-            else:
-                z = parent[4] - height if sign < 0 else parent[5]
-                x_min = generator.uniform(
-                    max(-half_cube, parent[0] - width + epsilon),
-                    min(parent[1] - epsilon, half_cube - width),
-                )
-                y_min = generator.uniform(
-                    max(-half_cube, parent[2] - depth + epsilon),
-                    min(parent[3] - epsilon, half_cube - depth),
-                )
-                candidate = (x_min, x_min + width, y_min, y_min + depth, z, z + height)
-
-            if (
-                inside_cube(candidate)
-                and not any(overlaps(candidate, existing) for existing in bounds_list)
-            ):
-                contact_area = face_contact_area(candidate, parent, direction)
-                if contact_area > epsilon:
-                    candidates.append((contact_area, candidate))
+                for candidate in candidate_positions:
+                    if (
+                        inside_cube(candidate)
+                        and not any(overlaps(candidate, existing) for existing in bounds_list)
+                    ):
+                        contact_area = face_contact_area(candidate, parent, direction)
+                        if contact_area > epsilon:
+                            candidates.append((contact_area, candidate))
 
         if not candidates:
             raise RuntimeError(
@@ -1096,6 +1127,95 @@ def create_connected_3d_boxes(
         _, candidate = generator.choice(candidates[:best_count])
         bounds_list.append(candidate)
         add_box(candidate, generator.choice(palette))
+
+    total_volume = 0.0
+    center_of_mass_x = 0.0
+    center_of_mass_y = 0.0
+    center_of_mass_z = 0.0
+    for bounds in bounds_list:
+        width = bounds[1] - bounds[0]
+        depth = bounds[3] - bounds[2]
+        height = bounds[5] - bounds[4]
+        volume = width * depth * height
+        center_of_mass_x += ((bounds[0] + bounds[1]) / 2.0) * volume
+        center_of_mass_y += ((bounds[2] + bounds[3]) / 2.0) * volume
+        center_of_mass_z += ((bounds[4] + bounds[5]) / 2.0) * volume
+        total_volume += volume
+
+    center_of_mass = (
+        center_of_mass_x / total_volume,
+        center_of_mass_y / total_volume,
+        center_of_mass_z / total_volume,
+    )
+    lowest_z = min(bounds[4] for bounds in bounds_list)
+    support_points = []
+    for bounds in bounds_list:
+        if abs(bounds[4] - lowest_z) <= epsilon:
+            support_points.extend(
+                [
+                    (bounds[0], bounds[2]),
+                    (bounds[1], bounds[2]),
+                    (bounds[1], bounds[3]),
+                    (bounds[0], bounds[3]),
+                ]
+            )
+
+    support_points = sorted(set(support_points))
+    support_hull = []
+    for point in support_points:
+        while len(support_hull) >= 2:
+            previous = support_hull[-1]
+            before_previous = support_hull[-2]
+            cross = (
+                (previous[0] - before_previous[0]) * (point[1] - previous[1])
+                - (previous[1] - before_previous[1]) * (point[0] - previous[0])
+            )
+            if cross <= epsilon:
+                support_hull.pop()
+            else:
+                break
+        support_hull.append(point)
+
+    upper_hull = []
+    for point in reversed(support_points):
+        while len(upper_hull) >= 2:
+            previous = upper_hull[-1]
+            before_previous = upper_hull[-2]
+            cross = (
+                (previous[0] - before_previous[0]) * (point[1] - previous[1])
+                - (previous[1] - before_previous[1]) * (point[0] - previous[0])
+            )
+            if cross <= epsilon:
+                upper_hull.pop()
+            else:
+                break
+        upper_hull.append(point)
+    support_hull = support_hull[:-1] + upper_hull[:-1]
+
+    stable = False
+    if len(support_hull) == 1:
+        stable = (
+            abs(center_of_mass[0] - support_hull[0][0]) <= stability_tolerance
+            and abs(center_of_mass[1] - support_hull[0][1]) <= stability_tolerance
+        )
+    elif len(support_hull) >= 3:
+        cross_products = []
+        for index, point in enumerate(support_hull):
+            next_point = support_hull[(index + 1) % len(support_hull)]
+            cross_products.append(
+                (next_point[0] - point[0]) * (center_of_mass[1] - point[1])
+                - (next_point[1] - point[1]) * (center_of_mass[0] - point[0])
+            )
+        stable = min(cross_products) >= -stability_tolerance
+
+    if not stable:
+        warning = (
+            "Warning: composition is unstable. The center of mass projects "
+            "outside the bottom support footprint."
+        )
+        print(warning)
+        if highlight_unstable:
+            colors = [Color.Red] * len(colors)
 
     return geometry, colors
 
